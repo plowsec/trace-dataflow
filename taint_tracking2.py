@@ -4,10 +4,12 @@ import archinfo
 import logging
 import better_exceptions
 
+from enum import Enum
+
+
 # Configure logging
 fmt = '%(asctime)s | %(levelname)3s | [%(filename)s:%(lineno)3d] %(funcName)s() | %(message)s'
 datefmt = '%Y-%m-%d %H:%M:%S'  # Date format without milliseconds
-
 
 class CustomFormatter(logging.Formatter):
     COLOR_CODES = {
@@ -26,9 +28,12 @@ class CustomFormatter(logging.Formatter):
 
 
 logger = logging.getLogger(__name__)
-handler = logging.StreamHandler()
-handler.setFormatter(CustomFormatter(fmt, datefmt))
-logger.addHandler(handler)
+logger.propagate = False  # Prevent log messages from being passed to the root logger
+
+# Create and add the stream handler
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(CustomFormatter(fmt, datefmt))
+logger.addHandler(stream_handler)
 
 # Add a file handler to the logger
 file_handler = logging.FileHandler('logfile.log')
@@ -57,11 +62,9 @@ global_state = {
         'rax': 2074114048112,
         'rsp': 18446606099673871232,
     },
-    'stack': {}
+    'stack': {},
+    'memory': {}
 }
-
-from enum import Enum
-
 
 class OperandKind(Enum):
     SOURCE = "source"
@@ -82,8 +85,9 @@ class StackVariableOperand(Operand):
 
 
 class RegisterOperand(Operand):
-    def __init__(self, kind, name, value):
+    def __init__(self, kind, address, value, name):
         super().__init__(kind, value)
+        self.address = address
         self.name = name
 
 
@@ -92,18 +96,52 @@ stack_variables = {}
 
 # Function to get the register name from the offset using archinfo
 def get_register_name(offset):
-    return arch.register_names.get(offset, None)
+    reg_name = arch.register_names.get(offset, None)
+    if reg_name.startswith("ymm"):
+        return reg_name.replace("ymm", "xmm")
+
+    return reg_name
 
 
 # Function to extract memory read/write information
+
 def extract_mem_info(regs):
-    logger.debug(f"Extracting memory info from: {regs}")
-    mem_info = re.search(r'(mr|mw)=(0x[0-9a-fA-F]+):([0-9a-fA-F]+)', regs)
-    if mem_info:
-        logger.debug(f"Memory operation found: {mem_info.groups()}")
-        return mem_info.group(1), int(mem_info.group(2), 16), int(mem_info.group(3), 16)
-    logger.debug("No memory operation found.")
-    return None, None, None
+    logger.debug(f"Extracting memory info from: {regs}"[:1024])
+
+    # Define the patterns for "mw", "mr", and "mwr"
+    mw_pattern = re.compile(r'mw=0x([0-9a-fA-F]+):([0-9a-fA-F]+)')
+    mr_pattern = re.compile(r'mr=0x([0-9a-fA-F]+):([0-9a-fA-F]+)')
+    mwr_pattern = re.compile(r'mwr=0x([0-9a-fA-F]+):([0-9a-fA-F]+)')
+
+    # Initialize a list to store the results
+    results = []
+
+    # Find all occurrences of "mwr" and add them to the results as both "mw" and "mr"
+    for match in mwr_pattern.findall(regs):
+        address, value = match
+        results.append(('mw', int(address, 16), int(value, 16)))
+        results.append(('mr', int(address, 16), int(value, 16)))
+
+    # Remove "mwr" from the line to avoid double counting
+    regs = mwr_pattern.sub('', regs)
+
+    # Find all occurrences of "mw" and add them to the results
+    for match in mw_pattern.findall(regs):
+        address, value = match
+        results.append(('mw', int(address, 16), int(value, 16)))
+
+    # Find all occurrences of "mr" and add them to the results
+    for match in mr_pattern.findall(regs):
+        address, value = match
+        results.append(('mr', int(address, 16), int(value, 16)))
+
+    if results:
+        for result in results:
+            logger.debug(f"Memory operation found: {result}")
+    else:
+        logger.debug("No memory operation found.")
+
+    return results
 
 
 # Function to parse a line from the trace
@@ -173,8 +211,11 @@ def intra_instruction_taint_analysis(irsb):
             elif isinstance(stmt.data, pyvex.expr.Unop):
                 if isinstance(stmt.data.args[0], pyvex.expr.RdTmp):
                     src_tmp = stmt.data.args[0].tmp
+                    if tmp_values.get(src_tmp) is None:
+                        logger.error(f"Unop: Source temp value is None, stmt={stmt}")
                     tmp_values[stmt.tmp] = tmp_values.get(src_tmp)
                     tmp_taint[stmt.tmp] = tmp_taint.get(src_tmp)
+
                     logger.debug(
                         f"Unop: src_tmp={src_tmp}, tmp_values[{stmt.tmp}]={hex(tmp_values[stmt.tmp])}, tmp_taint[{stmt.tmp}]={tmp_taint[stmt.tmp]}")
                     if src_tmp in operand_map:
@@ -188,15 +229,28 @@ def intra_instruction_taint_analysis(irsb):
                         f"Load: addr={hex(addr)}, tmp_values[{stmt.tmp}]={hex(tmp_values[stmt.tmp])}, tmp_taint[{stmt.tmp}]={tmp_taint[stmt.tmp]}")
                     if addr in stack_variables:
                         operand_map[stmt.tmp] = stack_variables.get(addr)
+                    else:
+                        logger.debug(f"Creating stack variable for address: {hex(addr)}")
+                        stack_variables[addr] = StackVariableOperand(OperandKind.SOURCE, addr, 0, "unknown")
+                        operand_map[stmt.tmp] = stack_variables.get(addr)
                 else:
                     addr_tmp = stmt.data.addr.tmp
                     addr = tmp_values.get(addr_tmp)
-                    tmp_values[stmt.tmp] = stack_variables.get(addr).value if addr in stack_variables else 0
+                    if addr in stack_variables:
+                        operand_map[stmt.tmp] = stack_variables.get(addr)
+                    else:
+                        logger.debug(f"Creating stack variable for address: {hex(addr)}")
+                        value = global_state['memory'].get(addr)
+                        if value is None:
+                            logger.warning(f"Memory value at address {hex(addr)} is None")
+                        stack_variables[addr] = StackVariableOperand(OperandKind.SOURCE, addr, value, "unknown")
+                        operand_map[stmt.tmp] = stack_variables.get(addr)
+
+                    tmp_values[stmt.tmp] = stack_variables.get(addr).value if addr in stack_variables else None
                     tmp_taint[stmt.tmp] = taint_map.get(addr)
                     logger.debug(
                         f"Load: addr_tmp={addr_tmp}, addr={hex(addr)}, tmp_values[{stmt.tmp}]={hex(tmp_values[stmt.tmp])}, tmp_taint[{stmt.tmp}]={tmp_taint[stmt.tmp]}")
-                    if addr in stack_variables:
-                        operand_map[stmt.tmp] = stack_variables.get(addr)
+
             elif isinstance(stmt.data, pyvex.expr.Get):
                 reg_name = get_register_name(stmt.data.offset)
                 tmp_values[stmt.tmp] = global_state['registers'].get(reg_name)
@@ -207,7 +261,8 @@ def intra_instruction_taint_analysis(irsb):
                     operand_map[stmt.tmp] = StackVariableOperand(OperandKind.SOURCE, tmp_values[stmt.tmp],
                                                                  tmp_taint[stmt.tmp], "unknown")
                 else:
-                    operand_map[stmt.tmp] = RegisterOperand(OperandKind.SOURCE, reg_name, tmp_taint[stmt.tmp])
+                    operand_map[stmt.tmp] = RegisterOperand(OperandKind.SOURCE, tmp_taint[stmt.tmp],
+                                                            tmp_taint[stmt.tmp], reg_name)
             elif isinstance(stmt.data, pyvex.expr.Const):
                 tmp_values[stmt.tmp] = stmt.data.con.value
                 tmp_taint[stmt.tmp] = None
@@ -216,15 +271,33 @@ def intra_instruction_taint_analysis(irsb):
             elif isinstance(stmt.data, pyvex.expr.Binop):
                 arg0 = get_tmp_value(stmt.data.args[0].tmp, tmp_values) if isinstance(stmt.data.args[0],
                                                                                       pyvex.expr.RdTmp) else \
-                stmt.data.args[
-                    0].con.value if isinstance(stmt.data.args[0], pyvex.expr.Const) else None
+                    stmt.data.args[
+                        0].con.value if isinstance(stmt.data.args[0], pyvex.expr.Const) else None
 
                 arg1 = stmt.data.args[1].con.value if isinstance(stmt.data.args[1],
                                                                  pyvex.expr.Const) else get_tmp_value(
                     stmt.data.args[1].tmp, tmp_values)
 
-                if isinstance(stmt.data.args[0], pyvex.expr.RdTmp):
+                if isinstance(stmt.data.args[0], pyvex.expr.RdTmp) and isinstance(stmt.data.args[1], pyvex.expr.RdTmp):
+                    operand1 = operand_map.get(stmt.data.args[0].tmp)
+                    operand2 = operand_map.get(stmt.data.args[1].tmp)
+                    rd_tmp1 = stmt.data.args[0].tmp
+                    rd_tmp2 = stmt.data.args[1].tmp
+                    if rd_tmp1 in tmp_values and rd_tmp2 in tmp_values:
+                        if stmt.data.op.startswith('Iop_Add'):
+                            tmp_values[stmt.tmp] = tmp_values[rd_tmp1] + tmp_values[rd_tmp2]
+                            operand_map[stmt.tmp] = RegisterOperand(OperandKind.SOURCE, tmp_values[stmt.tmp],
+                                                                    tmp_values[rd_tmp1] + tmp_values[rd_tmp2], "unknown")
+                        else:
+                            logger.error(f"Binop with both RdTmp: Not handled, stmt={stmt}")
+                    else:
+                        logger.error(f"Binop: One of the arguments is None, arg0={arg0}, arg1={arg1}")
+
+                elif isinstance(stmt.data.args[0], pyvex.expr.RdTmp):
                     operand = operand_map.get(stmt.data.args[0].tmp)
+                    if operand is None:
+                        logger.warning(f"Binop: Operand is None, stmt={stmt}, stmts={irsb.statements}")
+                        continue
                     if isinstance(operand, StackVariableOperand):
                         offset = stmt.data.args[1].con.value if isinstance(stmt.data.args[1],
                                                                            pyvex.expr.Const) else None
@@ -237,8 +310,19 @@ def intra_instruction_taint_analysis(irsb):
                                 f"Stack variable offset: {name}, address={hex(address)}, pyvex_name={stmt.tmp}")
                         else:
                             logger.error(f"Binop: Stack variable offset is None, stmt={stmt}")
+                    else:
+                        offset = stmt.data.args[1].con.value if isinstance(stmt.data.args[1],
+                                                                           pyvex.expr.Const) else None
+                        if offset is not None:
+                            name = f"{operand.name}+{hex(offset)}"
+                            address = tmp_values.get(stmt.data.args[0].tmp) + offset
+                            operand_map[stmt.tmp] = RegisterOperand(OperandKind.SOURCE, address,
+                                                                    tmp_values.get(stmt.data.args[0].tmp), name)
+                            logger.debug(
+                                f"Register + offset: {name}, address={hex(address)}, pyvex_name={stmt.tmp}")
 
-                if isinstance(stmt.data.args[1], pyvex.expr.RdTmp):
+
+                elif isinstance(stmt.data.args[1], pyvex.expr.RdTmp):
                     operand = operand_map.get(stmt.data.args[1].tmp)
                     if isinstance(operand, StackVariableOperand):
                         offset = stmt.data.args[0].con.value if isinstance(stmt.data.args[0],
@@ -253,18 +337,70 @@ def intra_instruction_taint_analysis(irsb):
                         else:
                             logger.error(f"Binop: Stack variable offset is None, stmt={stmt}")
 
-                if stmt.data.op.startswith('Iop_Add'):
+                if stmt.data.op.startswith('Iop_Add') or stmt.data.op.startswith('Iop_And') or stmt.data.op.startswith(
+                    'Iop_Sub') or stmt.data.op.startswith('Iop_Xor') or stmt.data.op.startswith('Iop_Shl') or \
+                        stmt.data.op.startswith('Iop_Or'):
+                    # TODO: better way to check that
+
                     if arg0 is not None and arg1 is not None:
-                        tmp_values[stmt.tmp] = arg0 + arg1
-                        logger.debug(f"Binop Add: tmp_values[{stmt.tmp}]={tmp_values[stmt.tmp]}")
+                        # Determine the size in bits from the operation type
+                        size_in_bits = stmt.data.tag_int*8
+                        # Calculate the mask based on the size
+                        mask = (1 << size_in_bits) - 1
+
+                        if stmt.data.op.startswith('Iop_Add'):
+                            # Perform the addition and apply the mask
+                            result = (arg0 + arg1) & mask
+                            tmp_values[stmt.tmp] = result
+                            logger.debug(f"Binop Add: tmp_values[{stmt.tmp}]={hex(tmp_values[stmt.tmp])}")
+
+                        elif stmt.data.op.startswith('Iop_And'):
+                            # Perform the AND operation and apply the mask
+                            result = (arg0 & arg1) & mask
+                            tmp_values[stmt.tmp] = result
+                            logger.debug(f"Binop And: tmp_values[{stmt.tmp}]={hex(tmp_values[stmt.tmp])}")
+
+                        elif stmt.data.op.startswith('Iop_Sub'):
+                            # Perform the subtraction and apply the mask
+                            result = (arg0 - arg1) & mask
+                            tmp_values[stmt.tmp] = result
+                            logger.debug(f"Binop Sub: tmp_values[{stmt.tmp}]={hex(tmp_values[stmt.tmp])}")
+                        elif stmt.data.op.startswith('Iop_Xor'):
+                            # Perform the XOR operation
+                            result = (arg0 ^ arg1) & mask
+                            tmp_values[stmt.tmp] = result
+                            logger.debug(f"Binop Xor: tmp_values[{stmt.tmp}]={hex(tmp_values[stmt.tmp])}")
+                        elif stmt.data.op.startswith('Iop_Shl'):
+                            # Perform the shift left operation
+                            result = (arg0 << arg1) & mask
+                            tmp_values[stmt.tmp] = result
+                            logger.debug(f"Binop Shl: tmp_values[{stmt.tmp}]={hex(tmp_values[stmt.tmp])}")
+                        elif stmt.data.op.startswith('Iop_Or'):
+                            # Perform the OR operation
+                            result = (arg0 | arg1) & mask
+                            tmp_values[stmt.tmp] = result
+                            logger.debug(f"Binop Or: tmp_values[{stmt.tmp}]={hex(tmp_values[stmt.tmp])}")
                     else:
-                        logging.error(f"Binop Add: One of the arguments is None, arg0={arg0}, arg1={arg1}")
+                        logging.error(
+                            f"Binop {stmt.data.op.split('_')[1]}: One of the arguments is None, arg0={arg0}, arg1={arg1}")
                 else:
-                    logger.debug(f"Binop: Not handled, stmt={stmt}")
+                    logger.error(f"Binop: Operation not handled, stmt={stmt}")
+
+            elif isinstance(stmt.data, pyvex.expr.Const):
+                tmp_values[stmt.tmp] = stmt.data.con.value
+                tmp_taint[stmt.tmp] = None
+                logger.debug(
+                    f"WrTmp Const: tmp_values[{stmt.tmp}]={tmp_values[stmt.tmp]}, tmp_taint[{stmt.tmp}]={hex(tmp_taint[stmt.tmp])}")
+            else:
+                logger.error(f"WrTmp statement with data type {type(stmt.data)} not implemented")
 
         elif isinstance(stmt, pyvex.stmt.Put):
             logger.debug(f"Handling Put statement: {stmt}")
             reg_name = get_register_name(stmt.offset)
+
+            if reg_name.startswith("cc"):
+                logger.debug(f"Skipping condition code register: {reg_name}")
+                continue
             if isinstance(stmt.data, pyvex.expr.RdTmp):
                 src_tmp = stmt.data.tmp
                 #logger.debug(f"Updating register {reg_name} with value from temp {hex(src_tmp)}")
@@ -288,7 +424,7 @@ def intra_instruction_taint_analysis(irsb):
                     addr_tmp = stmt.addr.tmp
                     addr = tmp_values.get(addr_tmp)
                     operand_map[stmt.addr.tmp].kind = OperandKind.DESTINATION
-                    logger.debug(f"RdTmp addr: addr_tmp={addr_tmp}, addr={addr}")
+                    logger.debug(f"RdTmp addr: addr_tmp={addr_tmp}, addr={hex(addr)}")
                 else:
                     addr = stmt.addr.con.value
                     logger.debug(f"Const addr: addr={addr}")
@@ -300,9 +436,25 @@ def intra_instruction_taint_analysis(irsb):
                         taint_map[addr] = tmp_taint[src_tmp]
                     logger.debug(
                         f"Store: addr={addr}, stack_variables[{addr}]={stack_variables[addr].value}, taint_map[{addr}]={taint_map.get(addr)}")
+            elif isinstance(stmt.data, pyvex.expr.Const):
+                logger.debug(f"Store statement with constant data: {stmt}")
+                if isinstance(stmt.addr, pyvex.expr.RdTmp):
+                    addr_tmp = stmt.addr.tmp
+                    addr = tmp_values.get(addr_tmp)
+                    logger.debug(f"RdTmp addr: addr_tmp={addr_tmp}, addr={hex(addr)}")
+                else:
+                    addr = stmt.addr.con.value
+                    logger.debug(f"Const addr: addr={addr}")
 
+                if addr is not None:
+                    stack_variables[addr] = StackVariableOperand(OperandKind.SOURCE, addr, stmt.data.con.value,
+                                                             "unknown")
+                    logger.debug(
+                        f"Store: addr={addr}, stack_variables[{addr}]={stack_variables[addr].value}, taint_map[{addr}]={taint_map.get(addr)}")
+            else:
+                logger.error(f"Store statement with data type {type(stmt.data)} not implemented")
 
-        elif isinstance(stmt, pyvex.stmt.IMark) or isinstance(stmt, pyvex.stmt.AbiHint):
+        elif isinstance(stmt, pyvex.stmt.IMark) or isinstance(stmt, pyvex.stmt.AbiHint) or isinstance(stmt, pyvex.stmt.Exit):
             pass
         else:
             raise NotImplementedError(f"Store statement with data type {type(stmt)} not implemented")
@@ -343,97 +495,175 @@ def process_irsb(irsb, instruction_bytes, instructions_text, taint_flows, rip):
                         f"Taint flow added: rip={rip}, src_tmp={src_tmp}, src_value={stack_variables[addr].value}, dest={addr}, instr={instructions_text}")
 
 
-# Function to perform taint analysis
-def taint_analysis(parsed_trace, source_buffer, source_size):
-    taint_flows = []
-    for line in parsed_trace:
-        regs, instr = parse_line(line)
-        logger.info(f"Parsed line: regs={regs}, instr={instr}")
-        if regs and instr:
-            rip = extract_reg_value(regs, 'rip')
-            mem_op, mem_addr, mem_value = extract_mem_info(regs)
-            logger.debug(
-                f"Processing instruction at RIP: {hex(rip)}, mem_op: {mem_op}, mem_addr: {mem_addr}, mem_value: {mem_value}")
 
-            # update register values
+def handle_memory_read(mem_addr, mem_value, instr, rip, taint_flows, source_buffer, source_size):
+    logger.debug(f"Memory read operation at address: {mem_addr}")
+    if source_buffer <= mem_addr < source_buffer + source_size:
+        origin = f"{mem_addr - source_buffer} (byte offset in source buffer)"
+        update_taint_map(mem_addr, mem_value, origin)
+    else:
+        origin = get_origin(mem_addr)
+        if origin:
+            update_taint_map(mem_addr, mem_value, origin)
+    irsb = analyze_instruction(bytes.fromhex(instr.split()[0]), rip)
+    for stmt in irsb.statements:
+        if isinstance(stmt, pyvex.stmt.Put):
+            reg_name = get_register_name(stmt.offset)
+            if reg_name:
+                taint_flows.append({
+                    'rip': rip,
+                    'src': mem_addr,
+                    'src_value': mem_value,
+                    'dest': reg_name,
+                    'dest_type': 'reg',
+                    'instr': instr.split()[1:]
+                })
+                logger.debug(
+                    f"Taint flow added: rip={rip}, src={mem_addr}, src_value={mem_value}, dest={reg_name}, instr={instr}")
+
+
+def handle_memory_write(mem_addr, instr, rip, taint_flows):
+    logger.debug(f"Memory write operation at address: {mem_addr}")
+    irsb = analyze_instruction(bytes.fromhex(instr.split()[0]), rip)
+    for stmt in irsb.statements:
+        if isinstance(stmt, pyvex.stmt.Put):
+            reg_name = get_register_name(stmt.offset)
+            if reg_name and reg_name in global_state['registers']:
+                mem_value = global_state['registers'][reg_name]  # Use the tracked register value
+                if mem_value in taint_map or mem_addr in taint_map:
+                    taint_flows.append({
+                        'rip': rip,
+                        'src': reg_name,
+                        'src_value': mem_value,
+                        'dest': mem_addr,
+                        'dest_type': 'mem',
+                        'instr': instr.split()[1:]
+                    })
+                    logger.debug(
+                        f"Taint flow added: rip={rip}, src={reg_name}, src_value={mem_value}, dest={mem_addr}, instr={instr}")
+                    update_taint_map(mem_addr, mem_value, get_origin(mem_value))
+                else:
+                    logger.debug(f"Memory address {hex(mem_addr)} not tainted, skipping")
+
+def handle_undetected_memory_write(regs, instr):
+    rip = extract_reg_value(regs, 'rip')
+    instr_bytes = bytes.fromhex(instr.split()[0])
+    irsb = analyze_instruction(instr_bytes, rip)
+    # extract both source and destination registers
+    reg_list = [arch.register_names.get(a.offset) for a in irsb.statements if hasattr(a, 'offset')]
+    reg_list.extend([arch.register_names.get(a.data.offset) for a in irsb.statements if
+                     hasattr(a, 'data') and hasattr(a.data, 'offset')])
+    # remove all registers that start with "cc":
+    reg_list = list(set([reg for reg in reg_list if not reg.startswith("cc")]))
+    if len(reg_list) == 1:
+        new_reg_name = reg_list[0]
+        if new_reg_name.startswith("ymm"):
+            new_reg_name = new_reg_name.replace("ymm", "xmm")
+
+        logger.debug(f"XOR: Updating register {new_reg_name} value: 0")
+        global_state['registers'][new_reg_name] = 0
+    elif reg_list[0] in global_state['registers'] and reg_list[1] in global_state['registers']:
+        # global_state['registers'][regs[0]] = global_state['registers'][regs[1]] ^ global_state['registers'][regs[0]]
+        # normally not needed, because we already have the updated register value provided in the trace
+        # but probably a good place to have an assert
+        pass
+    else:
+        logger.warning(f"XOR: Could not find both registers in global state: {reg_list}")
+
+
+def update_all_registers(regs):
+
+    global global_state
+
+    if regs:
+
+        # finally, update register values
+        # do it at the end because of operations such as movzx eax,byte ptr [rax+r9+0C40120h]
+        for reg in arch.register_names.values():
+            reg_value = extract_reg_value(regs, reg)
+            if reg_value is not None:
+                logger.debug(f"Updating register {reg} value: {hex(reg_value)}")
+                global_state['registers'][reg] = reg_value
+
+def handle_initialization(regs, instr, line):
+    if regs is None and instr is None:
+        if "rax" in line:
             for reg in arch.register_names.values():
-                reg_value = extract_reg_value(regs, reg)
+                reg_value = extract_reg_value(line, reg)
                 if reg_value is not None:
                     logger.debug(f"Updating register {reg} value: {hex(reg_value)}")
                     global_state['registers'][reg] = reg_value
-            if mem_op == 'mr':
-                logger.debug(f"Memory read operation at address: {mem_addr}")
-                if source_buffer <= mem_addr < source_buffer + source_size:
-                    origin = f"{mem_addr - source_buffer} (byte offset in source buffer)"
-                    update_taint_map(mem_addr, mem_value, origin)
-                else:
-                    origin = get_origin(mem_addr)
-                    if origin:
-                        update_taint_map(mem_addr, mem_value, origin)
-                irsb = analyze_instruction(bytes.fromhex(instr.split()[0]), rip)
-                for stmt in irsb.statements:
-                    if isinstance(stmt, pyvex.stmt.Put):
-                        reg_name = get_register_name(stmt.offset)
-                        if reg_name:
-                            taint_flows.append({
-                                'rip': rip,
-                                'src': mem_addr,
-                                'src_value': mem_value,
-                                'dest': reg_name,
-                                'dest_type': 'reg',
-                                'instr': instr.split()[1:]
-                            })
-                            logging.debug(
-                                f"Taint flow added: rip={rip}, src={mem_addr}, src_value={mem_value}, dest={reg_name}, instr={instr}")
-            elif mem_op == 'mw':
-                logger.debug(f"Memory write operation at address: {mem_addr}")
-                irsb = analyze_instruction(bytes.fromhex(instr.split()[0]), rip)
-                for stmt in irsb.statements:
-                    if isinstance(stmt, pyvex.stmt.Put):
-                        reg_name = get_register_name(stmt.offset)
-                        if reg_name and reg_name in global_state['registers']:
-                            mem_value = global_state['registers'][reg_name]  # Use the tracked register value
-                            if mem_value in taint_map or mem_addr in taint_map:
-                                taint_flows.append({
-                                    'rip': rip,
-                                    'src': reg_name,
-                                    'src_value': mem_value,
-                                    'dest': mem_addr,
-                                    'dest_type': 'mem',
-                                    'instr': instr.split()[1:]
-                                })
-                                logger.debug(
-                                    f"Taint flow added: rip={rip}, src={reg_name}, src_value={mem_value}, dest={mem_addr}, instr={instr}")
-                                update_taint_map(mem_addr, mem_value, get_origin(mem_value))
-                            else:
-                                logger.debug(f"Memory address {hex(mem_addr)} not tainted, skipping")
 
-            if mem_op is not None and "gs:" not in instr:
+def can_handle_instruction(instr, irsb):
+    can_handle = not any(isinstance(stmt.data, pyvex.expr.CCall) for stmt in irsb.statements if hasattr(stmt, 'data'))
+    can_handle = can_handle and not "gs:" in instr
+    can_handle = can_handle and not "ret" in instr
+    return can_handle
+
+
+# Function to perform taint analysis
+def taint_analysis(parsed_trace, source_buffer, source_size):
+    taint_flows = []
+    has_initialized = False
+
+    for line in parsed_trace:
+        regs, instr = parse_line(line)
+        logger.info(f"Parsed line: regs={regs}, instr={instr}"[:1024])
+
+        if not has_initialized:
+            handle_initialization(regs, instr, line)
+            has_initialized = True
+
+        if regs and instr:
+            rip = extract_reg_value(regs, 'rip')
+            mem_infos = extract_mem_info(regs)
+
+            mem_op, mem_addr, mem_value = None, None, None
+            if len(mem_infos) > 1:
+                logger.warning(f"Multiple memory operations detected: {mem_infos}")
+            else:
+                mem_op, mem_addr, mem_value = mem_infos[0] if mem_infos else (None, None, None)
+
+            logger.debug(
+                f"Processing instruction at RIP: {hex(rip)}, mem_op: {mem_op}, mem_addr: {mem_addr}, mem_value: {mem_value}")
+            if mem_op is not None and "gs:" not in instr and not "ret" in instr:
+                # Analyze the instruction using PyVEX
+                global_state['memory'][mem_addr] = mem_value
+                logger.info(f"Updating global state. Memory: {mem_op} at address: {hex(mem_addr)}")
+
+            if mem_op == 'mr':
+
+                handle_memory_read(mem_addr, mem_value, instr, rip, taint_flows, source_buffer, source_size)
+
+            elif mem_op == 'mw':
+
+                handle_memory_write(mem_addr, instr, rip, taint_flows)
+
+            if mem_op is not None:
+
                 # Analyze the instruction using PyVEX
                 instr_bytes = bytes.fromhex(instr.split()[0])
                 logger.debug(f"Instruction bytes: {instr_bytes}")
                 irsb = analyze_instruction(instr_bytes, rip)
-                process_irsb(irsb, instr_bytes, instr.split()[1:], taint_flows, rip)
-            if mem_op is None and instr and regs and "xor" in instr and regs: #only rip was detected because the xor had no effect on the registers
-                rip = extract_reg_value(regs, 'rip')
-                instr_bytes = bytes.fromhex(instr.split()[0])
-                irsb = analyze_instruction(instr_bytes, rip)
-                # extract both source and destination registers
-                regs = [arch.register_names.get(a.offset) for a in irsb.statements if hasattr(a, 'offset')]
-                regs.extend([arch.register_names.get(a.data.offset) for a in irsb.statements if hasattr(a, 'data') and hasattr(a.data, 'offset')])
-                # remove all registers that start with "cc":
-                regs = list(set([reg for reg in regs if not reg.startswith("cc")]))
-                if len(regs) == 1:
-                    global_state['registers'][regs[0]] = 0
-                elif regs[0] in global_state['registers'] and regs[1] in global_state['registers']:
-                    global_state['registers'][regs[0]] = global_state['registers'][regs[1]] ^ global_state['registers'][regs[0]]
+
+                if can_handle_instruction(instr, irsb):
+                    process_irsb(irsb, instr_bytes, instr.split()[1:], taint_flows, rip)
                 else:
-                    logger.warning(f"XOR: Could not find both registers in global state: {regs}")
-                #print(regs)
+                    logger.warning(f"CCall or unsupported instruction detected, skipping: {instr}")
 
+            if mem_op is None and instr and regs and "xor" in instr and regs:
 
+                # only rip was detected because the xor had no effect on the registers
+                # however we can handle this case because we know the xor operation, if applied to the same register
+                # will result in 0 and we might not have the register in the trace or we might have missed it
+                # from an unsupported instruction
+                handle_undetected_memory_write(regs, instr)
 
+            update_all_registers(regs)
+
+    # now the taint is complete, we can print the taint flow
     print_taint_flow(taint_flows)
+
     return taint_flows
 
 
@@ -477,7 +707,8 @@ def print_taint_flow(taint_flows):
 
 if __name__ == "__main__":
     # Read the augmented trace file
-    with open('test_trace3.txt', 'r') as file:
+    with open('updated_trace.tt', 'r') as file:
+        #with open('test_trace3.txt', 'r') as file:
         parsed_trace = file.readlines()
 
     taint_analysis(parsed_trace, source_buffer, source_size)
