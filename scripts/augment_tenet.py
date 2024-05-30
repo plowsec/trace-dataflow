@@ -66,14 +66,14 @@ def write_updated_trace(file_path, updated_trace):
 
 
 def main():
-    trace_tt_path = 'trace.tt'
-    full_trace_path = 'full_trace.txt'
+    trace_tt_path = '../trace.tt'
+    full_trace_path = '../full_trace.txt'
 
     trace_entries = parse_trace_tt(trace_tt_path)
     full_trace = parse_full_trace(full_trace_path)
     rip_mapping = create_rip_mapping(trace_entries, full_trace)
     updated_trace = add_disassembly_to_trace(trace_entries, rip_mapping)
-    write_updated_trace('updated_trace.tt', updated_trace)
+    write_updated_trace('../updated_trace.tt', updated_trace)
 
 
 if __name__ == "__main__":

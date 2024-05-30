@@ -149,7 +149,7 @@ def format_taint_map(taint_map):
     return "\n".join(formatted_taint)
 
 def run():
-    with open("full_trace.txt") as f:
+    with open("../full_trace.txt") as f:
         full_trace = f.readlines()
 
     # map: address -> assembly

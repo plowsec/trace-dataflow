@@ -3,5 +3,7 @@ rsp=0xffff82836a9d7380,rip=0xfffff801738c3634 | 4883ec68 sub     rsp,68h
 rax=0x1e2ead4c070,rip=0xfffff801738c3664,mr=0xffff82836a9d7420:70C0D4EAE2010000 | 488b8424a0000000 mov     rax,qword ptr [rsp+0A0h]
 rip=0xfffff801738c3669,mw=0xffff82836a9d73b0:70C0D4EAE2010000 | 4889442430 mov     qword ptr [rsp+30h],rax
 rsp=0xffff82836a9d7378,rip=0xfffff801738c36a0,mw=0xffff82836a9d7378:86368C7301F8FFFF | e81a000000 call    nt!IopXxxControlFile (fffff801`738c36a0)
+rsp=0xffff82836a9d7340,rip=0xfffff801738c36b5,mw=0xffff82836a9d7340:0000000000000000 | 4157 push    r15
+rsp=0xffff82836a9d7190,rip=0xfffff801738c36bc | 4881ecb0010000 sub     rsp,1B0h
 r8=0x1e2ead4c070,rip=0xfffff801738c3705,mr=0xffff82836a9d73b0:70C0D4EAE2010000 | 4c8b842420020000 mov     r8,qword ptr [rsp+220h]
 rip=0xfffff801738c370d,mw=0xffff82836a9d7220:70C0D4EAE2010000 | 4c89842490000000 mov     qword ptr [rsp+90h],r8
