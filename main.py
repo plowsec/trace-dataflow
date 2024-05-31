@@ -27,16 +27,23 @@ def run():
 
     df = dataflow.DataFlowAnalyzer(source_buffer, source_size, global_state, taint_map)
     taint_flows = df.taint_analysis(parsed_trace)
+    df.visualize_graph(layout='kamada_kawai', figsize=(30, 30), node_size=700, font_size=10)
+
+
+
+    df.export_graph("test_graph.png")
+
     with open('taint_flows.json', 'w') as f:
         json.dump(taint_flows, f, indent=4)
     G = digraph.build_taint_digraph(taint_flows, source_buffer, source_size)
     digraph.print_edges_from_source(G, source_buffer)
 
 
+
 if __name__ == "__main__":
     # Read the augmented trace file
     #with open('updated_trace.tt', 'r') as file:
-    with open('tests/test_trace3.txt', 'r') as file:
+    with open('tests/test_trace2.txt', 'r') as file:
         parsed_trace = file.readlines()
 
     run()

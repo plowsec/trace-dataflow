@@ -1,2 +1,6 @@
 pyvex
 better_exceptions
+networkx
+matplotlib
+pygraphviz
+scipy
