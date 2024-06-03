@@ -11,6 +11,30 @@ import matplotlib.pyplot as plt
 
 
 
+class StatementNode:
+    def __init__(self, stmt, index, root=False):
+        self.stmt = stmt
+        self.root = root
+        self.index = index
+        self.dependents = []  # Statements that depend on this statement
+        self.dependencies = []  # Statements that this statement depends on
+        self.is_reg = False
+        self.reg_name = None
+        self.reg_value = None
+        self.is_const = False
+        self.const_value = None
+        self.is_ptr = False
+        self.ptr_addr = None
+        self.ptr_value = None
+
+    def add_dependent(self, node):
+        self.dependents.append(node)
+
+    def add_dependency(self, node):
+        self.dependencies.append(node)
+
+    def __repr__(self):
+        return f"StatementNode(index={self.index}, stmt={self.stmt}, dependents={self.dependents}, dependencies={self.dependencies})"
 
 class Node:
     def __init__(self, name: str, loc: int, value: int, rip: int, instruction: str, timestamp: int, node_kind: Enum, origin=None):
@@ -75,6 +99,68 @@ class DataFlowAnalyzer:
         self.add_node_to_graph(node)  # Add the source buffer node to the graph
         self.alias_to_mem["source"] = source_buffer  # Add the source buffer as an alias
         self.mem_to_alias[source_buffer] = "source"  # Add the source buffer as an alias
+        self.accessed_registers = set()  # Initialize a set to store the accessed registers
+        self.statements = []  # List to store the statement nodes
+        self.tmp_to_stmt = {}  # Map from temporary variables to statement nodes
+        self.current_rip = 0  # Initialize the current instruction pointer
+        self.current_instruction = ""  # Initialize the current instruction
+
+
+    def create_statement_node(self, stmt, index, root=False):
+        node = StatementNode(stmt, index, root)
+        self.statements.append(node)
+        return node
+
+    def get_dependencies(self, start_index):
+        visited = set()
+        dependencies = []
+
+        def dfs(node):
+            if node.index in visited:
+                return
+            visited.add(node.index)
+            dependencies.append(node)
+            for dep_node in node.dependencies:
+                dfs(dep_node)
+
+        if start_index < len(self.statements):
+            start_node = self.statements[start_index]
+            dfs(start_node)
+        return dependencies
+
+    def get_dependencies_from_node_stmt(self, node: StatementNode):
+        visited = set()
+        dependencies = []
+
+        def dfs(node):
+            if node.index in visited:
+                return
+            visited.add(node.index)
+            dependencies.append(node)
+            for dep_node in node.dependencies:
+                dfs(dep_node)
+
+        dfs(node)
+        return dependencies
+
+
+
+    def get_dependents(self, start_index):
+        visited = set()
+        dependents = []
+
+        def dfs(node):
+            if node.index in visited:
+                return
+            visited.add(node.index)
+            dependents.append(node)
+            for dep_node in node.dependents:
+                dfs(dep_node)
+
+        if start_index < len(self.statements):
+            start_node = self.statements[start_index]
+            dfs(start_node)
+        return dependents
 
     def create_node(self, name, loc, value, rip, instruction: str, node_kind, origin=None):
         logger.debug(f"Creating node: name={name}, loc={hex(loc) if isinstance(loc, int) else str(loc)}, value={hex(value) if isinstance(value, int) else str(value)}, rip={hex(rip) if isinstance(rip, int) else str(rip)}, instruction={instruction}, node_kind={node_kind}, origin={origin}")
@@ -253,25 +339,47 @@ class DataFlowAnalyzer:
     def get_tmp_value(tmp, tmp_values):
         return tmp_values.get(tmp, None)
 
+
+    def update_stmt_dependencies(self, stmt, index):
+
+        node = self.create_statement_node(stmt, index)
+        if isinstance(stmt.data, pyvex.expr.RdTmp):
+            src_tmp = stmt.data.tmp
+            if src_tmp in self.tmp_to_stmt:
+                src_node = self.tmp_to_stmt[src_tmp]
+                node.add_dependency(src_node)
+                src_node.add_dependent(node)
+            self.tmp_to_stmt[stmt.tmp] = node
+        elif isinstance(stmt.data, pyvex.expr.Binop):
+            for arg in stmt.data.args:
+                if isinstance(arg, pyvex.expr.RdTmp):
+                    src_tmp = arg.tmp
+                    if src_tmp in self.tmp_to_stmt:
+                        src_node = self.tmp_to_stmt[src_tmp]
+                        node.add_dependency(src_node)
+                        src_node.add_dependent(node)
+            self.tmp_to_stmt[stmt.tmp] = node
+
     # Function to perform intra-instruction taint analysis
-    def handle_wr_tmp(self, stmt, tmp_values, tmp_taint, operand_map):
+    def handle_wr_tmp(self, stmt, tmp_values, tmp_taint, operand_map, node: StatementNode):
+
         """Handle WrTmp statements."""
         if isinstance(stmt.data, pyvex.expr.RdTmp):
-            self.handle_wr_tmp_rdtmp(stmt, tmp_values, tmp_taint, operand_map)
+            self.handle_wr_tmp_rdtmp(stmt, tmp_values, tmp_taint, operand_map, node)
         elif isinstance(stmt.data, pyvex.expr.Unop):
-            self.handle_wr_tmp_unop(stmt, tmp_values, tmp_taint, operand_map)
+            self.handle_wr_tmp_unop(stmt, tmp_values, tmp_taint, operand_map, node)
         elif isinstance(stmt.data, pyvex.expr.Load):
-            self.handle_wr_tmp_load(stmt, tmp_values, tmp_taint, operand_map)
+            self.handle_wr_tmp_load(stmt, tmp_values, tmp_taint, operand_map, node)
         elif isinstance(stmt.data, pyvex.expr.Get):
-            self.handle_wr_tmp_get(stmt, tmp_values, tmp_taint, operand_map)
+            self.handle_wr_tmp_get(stmt, tmp_values, tmp_taint, operand_map, node)
         elif isinstance(stmt.data, pyvex.expr.Const):
-            self.handle_wr_tmp_const(stmt, tmp_values, tmp_taint)
+            self.handle_wr_tmp_const(stmt, tmp_values, tmp_taint, node)
         elif isinstance(stmt.data, pyvex.expr.Binop):
-            self.handle_wr_tmp_binop(stmt, tmp_values, tmp_taint, operand_map)
+            self.handle_wr_tmp_binop(stmt, tmp_values, tmp_taint, operand_map, node)
         else:
             logger.error(f"WrTmp statement with data type {type(stmt.data)} not implemented")
 
-    def handle_wr_tmp_rdtmp(self, stmt, tmp_values, tmp_taint, operand_map):
+    def handle_wr_tmp_rdtmp(self, stmt, tmp_values, tmp_taint, operand_map, node: StatementNode):
         """Handle WrTmp statements with RdTmp data."""
         src_tmp = stmt.data.tmp
         tmp_values[stmt.tmp] = tmp_values.get(src_tmp)
@@ -279,7 +387,15 @@ class DataFlowAnalyzer:
         logger.debug(
             f"RdTmp: src_tmp={src_tmp}, tmp_values[{stmt.tmp}]={hex(tmp_values[stmt.tmp])}, tmp_taint[{stmt.tmp}]={tmp_taint[stmt.tmp]}")
 
-    def handle_wr_tmp_unop(self, stmt, tmp_values, tmp_taint, operand_map):
+        if src_tmp in self.tmp_to_stmt:
+            src_node = self.tmp_to_stmt[src_tmp]
+            node.add_dependency(src_node)
+            src_node.add_dependent(node)
+        self.tmp_to_stmt[stmt.tmp] = node
+
+
+    def handle_wr_tmp_unop(self, stmt, tmp_values, tmp_taint, operand_map, node: StatementNode):
+
         """Handle WrTmp statements with Unop data."""
         if isinstance(stmt.data.args[0], pyvex.expr.RdTmp):
             src_tmp = stmt.data.args[0].tmp
@@ -292,7 +408,14 @@ class DataFlowAnalyzer:
             if src_tmp in operand_map:
                 operand_map[stmt.tmp] = operand_map[src_tmp]
 
-    def handle_wr_tmp_load(self, stmt, tmp_values, tmp_taint, operand_map):
+            if src_tmp in self.tmp_to_stmt:
+                src_node = self.tmp_to_stmt[src_tmp]
+                node.add_dependency(src_node)
+                src_node.add_dependent(node)
+            self.tmp_to_stmt[stmt.tmp] = node
+
+    def handle_wr_tmp_load(self, stmt, tmp_values, tmp_taint, operand_map, stmt_node: StatementNode):
+
         """Handle WrTmp statements with Load data."""
         if isinstance(stmt.data.addr, pyvex.expr.Const):
             addr = stmt.data.addr.con.value
@@ -308,7 +431,24 @@ class DataFlowAnalyzer:
                 node = self.create_node(hex(addr), addr, 0, 0, "", NodeKind.MEMORY)  # TODO stack
                 self.add_node_to_graph(node)
                 operand_map[stmt.tmp] = self.stack_variables.get(addr)
+
+            stmt_node.root = True
+            stmt_node.is_ptr = True
+            stmt_node.ptr_addr = addr
+            stmt_node.ptr_value = tmp_values[stmt.tmp]
+            self.tmp_to_stmt[stmt.tmp] = stmt_node
+
         else:
+
+            logger.debug(f"Load: Address is not a constant, stmt={stmt}")
+            if isinstance(stmt.data.addr, pyvex.expr.RdTmp):
+                addr_tmp = stmt.data.addr.tmp
+                if addr_tmp in self.tmp_to_stmt:
+                    addr_node = self.tmp_to_stmt[addr_tmp]
+                    stmt_node.add_dependency(addr_node)
+                    addr_node.add_dependent(stmt_node)
+            self.tmp_to_stmt[stmt.tmp] = stmt_node
+
             addr_tmp = stmt.data.addr.tmp
             addr = tmp_values.get(addr_tmp)
 
@@ -341,15 +481,23 @@ class DataFlowAnalyzer:
             tmp_taint[stmt.tmp] = self.taint_map.get(addr)
             logger.debug(
                 f"Load: addr_tmp={addr_tmp}, addr={hex(addr)}, tmp_values[{stmt.tmp}]={hex(tmp_values[stmt.tmp])}, tmp_taint[{stmt.tmp}]={tmp_taint[stmt.tmp]}")
+            stmt_node.root = True
+            stmt_node.is_ptr = True
+            stmt_node.ptr_addr = addr
+            stmt_node.ptr_value = tmp_values[stmt.tmp]
+            self.tmp_to_stmt[stmt.tmp] = stmt_node
 
-    def handle_wr_tmp_get(self, stmt, tmp_values, tmp_taint, operand_map):
+    def handle_wr_tmp_get(self, stmt, tmp_values, tmp_taint, operand_map, node):
         """Handle WrTmp statements with Get data."""
         reg_name = lift.get_register_name(stmt.data.offset)
         new_tmp_value = self.global_state['registers'].get(reg_name)
 
-        if new_tmp_value is None and reg_name == 'd' or reg_name.startswith('xmm'):
+
+
+        if new_tmp_value is None and (reg_name == 'd' or reg_name.startswith('xmm')):
             new_tmp_value = lift.arch.get_default_reg_value('d')
             logger.warning(f"Using default value for register 'd': {hex(new_tmp_value)}")
+            self.global_state['registers'][reg_name] = new_tmp_value
 
         if new_tmp_value is None:
             logger.error(f"Get: New temp value is None, stmt={stmt}")
@@ -382,14 +530,33 @@ class DataFlowAnalyzer:
             #node = self.create_node(reg_name, tmp_taint[stmt.tmp], tmp_taint[stmt.tmp], 0, "", NodeKind.REGISTER)
             #self.add_node_to_graph(node)
 
-    def handle_wr_tmp_const(self, stmt, tmp_values, tmp_taint):
+        node.root = True
+        node.is_reg = True
+        node.reg_name = reg_name
+        node.reg_value = tmp_taint[stmt.tmp]
+        self.tmp_to_stmt[stmt.tmp] = node
+
+    def handle_wr_tmp_const(self, stmt, tmp_values, tmp_taint, node):
         """Handle WrTmp statements with Const data."""
         tmp_values[stmt.tmp] = stmt.data.con.value
         tmp_taint[stmt.tmp] = None
         logger.debug(
             f"Const: tmp_values[{stmt.tmp}]={tmp_values[stmt.tmp]}, tmp_taint[{stmt.tmp}]={hex(tmp_taint[stmt.tmp])}")
+        node.root = True
+        node.is_const = True
+        node.const_value = tmp_values[stmt.tmp]
+        self.tmp_to_stmt[stmt.tmp] = node
+    def handle_wr_tmp_binop(self, stmt, tmp_values, tmp_taint, operand_map, node):
 
-    def handle_wr_tmp_binop(self, stmt, tmp_values, tmp_taint, operand_map):
+        for arg in stmt.data.args:
+            if isinstance(arg, pyvex.expr.RdTmp):
+                src_tmp = arg.tmp
+                if src_tmp in self.tmp_to_stmt:
+                    src_node = self.tmp_to_stmt[src_tmp]
+                    node.add_dependency(src_node)
+                    src_node.add_dependent(node)
+
+        self.tmp_to_stmt[stmt.tmp] = node
         """Handle WrTmp statements with Binop data."""
         arg0 = self.get_tmp_value(stmt.data.args[0].tmp, tmp_values) if isinstance(stmt.data.args[0],
                                                                                    pyvex.expr.RdTmp) else \
@@ -468,7 +635,7 @@ class DataFlowAnalyzer:
         """Handle Binop operations."""
         if stmt.data.op.startswith('Iop_Add') or stmt.data.op.startswith('Iop_And') or stmt.data.op.startswith(
                 'Iop_Sub') or stmt.data.op.startswith('Iop_Xor') or stmt.data.op.startswith(
-            'Iop_Shl') or stmt.data.op.startswith('Iop_Or') or stmt.data.op.startswith('Iop_Mul'):
+            'Iop_Shl') or stmt.data.op.startswith('Iop_Or') or stmt.data.op.startswith('Iop_Mul') or stmt.data.op.startswith('Iop_Shr'):
             if arg0 is not None and arg1 is not None:
                 size_in_bits = stmt.data.tag_int * 8
                 mask = (1 << size_in_bits) - 1
@@ -501,34 +668,64 @@ class DataFlowAnalyzer:
                     result = (arg0 * arg1) & mask
                     tmp_values[stmt.tmp] = result
                     logger.debug(f"Binop Mul: tmp_values[{stmt.tmp}]={hex(tmp_values[stmt.tmp])}")
+                elif stmt.data.op.startswith('Iop_Shr'):
+                    result = (arg0 >> arg1) & mask
+                    tmp_values[stmt.tmp] = result
+                    logger.debug(f"Binop Shr: tmp_values[{stmt.tmp}]={hex(tmp_values[stmt.tmp])}")
             else:
                 logger.error(
                     f"Binop {stmt.data.op.split('_')[1]}: One of the arguments is None, arg0={arg0}, arg1={arg1}")
         else:
             logger.error(f"Binop: Operation not handled, stmt={stmt}")
 
-    def handle_put(self, stmt, tmp_values, tmp_taint):
-        """Handle Put statements."""
+    def handle_put(self, stmt, tmp_values, tmp_taint, node):
+        """Handle Put statements.
+        :param index:
+        """
         reg_name = lift.get_register_name(stmt.offset)
         if reg_name.startswith("cc"):
             logger.debug(f"Skipping condition code register: {reg_name}")
             return
         if isinstance(stmt.data, pyvex.expr.RdTmp):
             src_tmp = stmt.data.tmp
-            if tmp_taint.get(src_tmp):
-                self.taint_map[reg_name] = (tmp_taint[src_tmp], 'default_value')
+            if tainted_val := tmp_taint.get(src_tmp):
+                if isinstance(tainted_val, tuple):
+                    self.taint_map[reg_name] = tainted_val
+                else:
+                    self.taint_map[reg_name] = (tmp_taint[src_tmp], 'default_value')
 
             if reg_name not in self.global_state['registers']:
                 self.global_state['registers'][reg_name] = tmp_values.get(src_tmp)
             logger.debug(
                 f"RdTmp: reg_name={reg_name}, src_tmp={src_tmp}, self.global_state['registers'][{reg_name}]={self.global_state['registers'][reg_name]}, self.taint_map[{reg_name}]={self.taint_map.get(reg_name)}")
+
+            if src_tmp in self.tmp_to_stmt:
+                src_node = self.tmp_to_stmt[src_tmp]
+                node.add_dependency(src_node)
+                src_node.add_dependent(node)
+
+                # Get all dependencies
+            index = node.index
+            dependencies = self.get_dependencies_from_node_stmt(node)
+            logger.debug(f"Dependencies for statement {stmt}: {dependencies}")
+            for dep in dependencies:
+                if dep.is_reg:
+                    self.add_link(reg_name, 0, dep.reg_name, 0,
+                                  NodeKind.REGISTER, NodeKind.REGISTER, self.global_state['registers'][reg_name],
+                                  self.current_rip, self.current_instruction, dep.reg_name)
+            # Get all dependents
+            dependents = self.get_dependents(index)
+            logger.debug(f"Dependents for statement {index}: {dependents}")
+
         elif isinstance(stmt.data, pyvex.expr.Const):
             self.global_state['registers'][reg_name] = stmt.data.con.value
             logger.debug(
                 f"Const: reg_name={reg_name}, self.global_state['registers'][{reg_name}]={self.global_state['registers'][reg_name]}")
 
-    def handle_store(self, stmt, tmp_values, tmp_taint, operand_map):
-        """Handle Store statements."""
+    def handle_store(self, stmt, tmp_values, tmp_taint, operand_map, node):
+        """Handle Store statements.
+        :param index:
+        """
         if isinstance(stmt.data, pyvex.expr.RdTmp):
             src_tmp = stmt.data.tmp
             operand_map[src_tmp].kind = OperandKind.SOURCE
@@ -537,23 +734,37 @@ class DataFlowAnalyzer:
                 addr = tmp_values.get(addr_tmp)
                 operand_map[stmt.addr.tmp].kind = OperandKind.DESTINATION
                 logger.debug(f"RdTmp addr: addr_tmp={addr_tmp}, addr={hex(addr)}")
+
+                if addr is not None:
+                    self.stack_variables[addr] = operand_map[stmt.addr.tmp]
+                    if isinstance(self.stack_variables[addr].value, tuple):
+                        self.stack_variables[addr].value = self.stack_variables[addr].value[0]
+                    # assert(not isinstance(self.stack_variables[addr].value, tuple))
+                    # logger.debug(f"Creating node for address: {hex(addr)}")
+                    # node = self.create_node(hex(addr), addr, tmp_values.get(src_tmp), 0, "", NodeKind.MEMORY)  # TODO stack
+                    # self.add_node_to_graph(node)
+
+                    if tmp_taint.get(src_tmp):
+                        self.taint_map[addr] = tmp_taint[src_tmp]
+                    logger.debug(
+                        f"Store: addr={addr}, stack_variables[{addr}]={self.stack_variables[addr].value}, self.taint_map[{addr}]={self.taint_map.get(addr)}")
             else:
                 addr = stmt.addr.con.value
                 logger.debug(f"Const addr: addr={addr}")
-            if addr is not None:
+                if addr is not None:
 
-                self.stack_variables[addr] = operand_map[stmt.addr.tmp]
-                if isinstance(self.stack_variables[addr].value, tuple):
-                    self.stack_variables[addr].value = self.stack_variables[addr].value[0]
-                #assert(not isinstance(self.stack_variables[addr].value, tuple))
-                #logger.debug(f"Creating node for address: {hex(addr)}")
-                #node = self.create_node(hex(addr), addr, tmp_values.get(src_tmp), 0, "", NodeKind.MEMORY)  # TODO stack
-                #self.add_node_to_graph(node)
+                    self.stack_variables[addr] = operand_map[stmt.data.tmp]
+                    if isinstance(self.stack_variables[addr].value, tuple):
+                        self.stack_variables[addr].value = self.stack_variables[addr].value[0]
+                    #assert(not isinstance(self.stack_variables[addr].value, tuple))
+                    #logger.debug(f"Creating node for address: {hex(addr)}")
+                    #node = self.create_node(hex(addr), addr, tmp_values.get(src_tmp), 0, "", NodeKind.MEMORY)  # TODO stack
+                    #self.add_node_to_graph(node)
 
-                if tmp_taint.get(src_tmp):
-                    self.taint_map[addr] = tmp_taint[src_tmp]
-                logger.debug(
-                    f"Store: addr={addr}, stack_variables[{addr}]={self.stack_variables[addr].value}, self.taint_map[{addr}]={self.taint_map.get(addr)}")
+                    if tmp_taint.get(src_tmp):
+                        self.taint_map[addr] = tmp_taint[src_tmp]
+                    logger.debug(
+                        f"Store: addr={addr}, stack_variables[{addr}]={self.stack_variables[addr].value}, self.taint_map[{addr}]={self.taint_map.get(addr)}")
         elif isinstance(stmt.data, pyvex.expr.Const):
             if isinstance(stmt.addr, pyvex.expr.RdTmp):
                 addr_tmp = stmt.addr.tmp
@@ -578,23 +789,26 @@ class DataFlowAnalyzer:
         tmp_taint = {}
         operand_map = {}
         logger.debug("Starting intra-instruction taint analysis")
-
+        index = 0
         for stmt in irsb.statements:
             logger.debug(f"Processing statement: {stmt}")
+            node = self.create_statement_node(stmt, index)
             if isinstance(stmt, pyvex.stmt.WrTmp):
                 logger.debug(f"Handling WrTmp statement: {stmt}")
-                self.handle_wr_tmp(stmt, tmp_values, tmp_taint, operand_map)
+                self.handle_wr_tmp(stmt, tmp_values, tmp_taint, operand_map, node)
             elif isinstance(stmt, pyvex.stmt.Put):
                 logger.debug(f"Handling Put statement: {stmt}")
-                self.handle_put(stmt, tmp_values, tmp_taint)
+                self.handle_put(stmt, tmp_values, tmp_taint, node)
             elif isinstance(stmt, pyvex.stmt.Store):
                 logger.debug(f"Handling Store statement: {stmt}")
-                self.handle_store(stmt, tmp_values, tmp_taint, operand_map)
+                self.handle_store(stmt, tmp_values, tmp_taint, operand_map, node)
             elif isinstance(stmt, pyvex.stmt.IMark) or isinstance(stmt, pyvex.stmt.AbiHint) or isinstance(stmt,
                                                                                                           pyvex.stmt.Exit):
                 pass
             else:
-                raise NotImplementedError(f"Store statement with data type {type(stmt)} not implemented")
+                raise NotImplementedError(f"Statement {type(stmt)} not implemented")
+
+            index += 1
 
         logger.debug("Completed intra-instruction taint analysis")
         return tmp_values, tmp_taint, operand_map
@@ -649,8 +863,11 @@ class DataFlowAnalyzer:
 
     def handle_memory_read(self, mem_addr, mem_value, instr, rip, taint_flows, source_buffer, source_size):
 
-        # convert to little endian
-        mem_value = int.from_bytes(mem_value.to_bytes(8, byteorder='little'), byteorder='big')
+        # Determine the number of bytes needed
+        num_bytes = (mem_value.bit_length() + 7) // 8
+
+        # Convert the integer to bytes in little endian and then back to an integer in big endian
+        mem_value = int.from_bytes(mem_value.to_bytes(num_bytes, byteorder='little'), byteorder='big')
 
         logger.debug(f"Memory read operation at address: {mem_addr}")
         if source_buffer < mem_addr < source_buffer + source_size:
@@ -791,7 +1008,7 @@ class DataFlowAnalyzer:
 
             self.handle_memory_write(mem_addr, instr, rip, taint_flows)
 
-        if mem_op is not None:
+        if mem_op is not None or len(regs) > 1:
 
             # Analyze the instruction using PyVEX
             instr_bytes = bytes.fromhex(instr.split()[0])
@@ -821,6 +1038,11 @@ class DataFlowAnalyzer:
             regs, instr = parse.parse_line(line)
             logger.info(f"Parsed line: regs={regs}, instr={instr}"[:1024])
 
+            self.tmp_to_stmt = {}
+            self.statements = []
+
+
+
             if not has_initialized:
                 self.handle_initialization(regs, instr, line)
                 has_initialized = True
@@ -828,6 +1050,8 @@ class DataFlowAnalyzer:
             if regs and instr:
                 rip = parse.extract_reg_value(regs, 'rip')
                 mem_infos = parse.extract_mem_info(regs)
+                self.current_instruction = " ".join(instr.split()[1:])
+                self.current_rip = rip
 
                 mem_op, mem_addr, mem_value = None, None, None
                 if len(mem_infos) > 1:
